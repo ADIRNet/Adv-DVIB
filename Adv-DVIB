@@ -1,0 +1,147 @@
+class VIB(nn.Module):
+    def __init__(self, X_dim, y_dim, domain_kind, dimZ=256, beta=1e-3, num_samples=10):
+        # the dimension of Z
+        super().__init__()
+
+        self.beta = beta
+        self.dimZ = dimZ
+        self.num_samples = num_samples
+        self.encoder = nn.Sequential(
+            nn.Linear(in_features=X_dim, out_features=256),
+                                     nn.ReLU(),
+                                     nn.Linear(in_features=256, out_features=1024),
+                                     nn.ReLU(),
+                                     nn.Linear(in_features=1024, out_features=2 * self.dimZ)).float()
+        self.fc1 = nn.Linear(self.dimZ, self.dimZ)
+        self.encoder1 = nn.LSTM(X_dim, 2 * self.dimZ, num_layers=2)
+        #  TODO: try heads
+        #         self.encoder_sigma_head = nn.Linear()
+        #         self.encoder_mu_head = ...
+
+        # decoder a simple logistic regression as in the paper
+        self.decoder_logits = nn.Linear(in_features=self.dimZ, out_features=y_dim)
+        self.domain_decoder = nn.Sequential(nn.Linear(in_features=self.dimZ, out_features=256),
+                                            nn.ReLU(),
+
+                                            nn.Linear(in_features=256, out_features=domain_kind))
+        self.domain_decoder_conv = nn.Sequential(nn.Conv1d(in_channels=1, out_channels=1, stride=2, padding=0,
+                                                           kernel_size=2),
+                                            nn.ReLU(),
+                                            nn.Linear(in_features=int((256-2)/2+1), out_features=domain_kind))
+
+    def gaussian_noise(self, num_samples, K):
+        # works with integers as well as tuples
+        return torch.normal(torch.zeros(*num_samples, K), torch.ones(*num_samples, K)).cuda()
+
+    def sample_prior_Z(self, num_samples):
+        return self.gaussian_noise(num_samples=num_samples, K=self.dimZ)
+
+    def encoder_result(self, batch):
+        encoder_output = self.encoder(batch)  # 注意
+        mu = F.elu(encoder_output[:, :self.dimZ])
+        sigma = F.elu(encoder_output[:, self.dimZ:])
+        return mu, sigma
+
+    def sample_encoder_Z(self, num_samples, batch):
+        batch_size = batch.size()[0]
+        mu, sigma = self.encoder_result(batch)
+        return mu + sigma * self.gaussian_noise(num_samples=(num_samples, batch_size), K=self.dimZ)
+
+    def forward(self, batch_x):
+        batch_size = batch_x.size()[0]
+
+        # sample from encoder
+        encoder_Z_distr = self.encoder_result(batch_x)
+        to_decoder = self.sample_encoder_Z(num_samples=self.num_samples, batch=batch_x)
+        decoder_logits_mean = torch.mean(self.decoder_logits(to_decoder), dim=0)
+        return decoder_logits_mean
+
+    def domain_classify(self, batch_x):
+        to_decoder = self.sample_encoder_Z(num_samples=self.num_samples, batch=batch_x)
+
+        # sample from encoder
+        domain_decoder_output = self.domain_decoder(torch.mean(to_decoder, dim=0))  # 线性分类器
+        domain_decoder_output = torch.argmax(domain_decoder_output, dim=1)
+        return domain_decoder_output
+
+
+    def batch_loss(self, num_samples, batch_x, batch_y, domain_label, weight, beta=0.01, lambda1=0.01): # self.beta删除
+        batch_size = batch_x.size()[0]
+        domain_label = domain_label.long()
+        prior_Z_distr = torch.zeros(batch_size, self.dimZ).cuda(), torch.ones(batch_size, self.dimZ).cuda()
+        encoder_Z_distr = self.encoder_result(batch_x)
+
+        I_ZX_bound = torch.mean(KL_between_normals(encoder_Z_distr, prior_Z_distr))
+        to_decoder = self.sample_encoder_Z(num_samples=self.num_samples, batch=batch_x)
+        decoder_logits = self.decoder_logits(to_decoder)  # 领域输出
+        # domain_decoder_output = self.domain_decoder(torch.cat((to_decoder,domain_label.unsqueeze(1).expand(num_samples,-1,self.dimZ)),dim=0))
+        # domain_decoder_output = self.domain_decoder(torch.mean(to_decoder, dim=0))
+        # 对领域分类器使用梯度反转层
+        domain_output = ReverseGrad()(torch.mean(to_decoder, dim=0), beta)
+        domain_decoder_output = self.domain_decoder(domain_output) #线性分类器
+        # domain_decoder_output = self.domain_decoder_conv(domain_output.view(domain_output.size(0), 1, -1))
+        # batch should go first
+        weights = torch.tensor(weight, dtype=torch.float32).cuda()  # 假设有两个类别
+        decoder_logits = decoder_logits.permute(1, 2, 0)
+        decoder_logits = decoder_logits.view(-1, num_samples)
+        loss = nn.MSELoss(reduction='none')
+        loss2 = nn.CrossEntropyLoss(weights, reduction='none')
+        cross_entropy_loss = loss(decoder_logits, batch_y[:, None].expand(-1, num_samples))
+        discrimination = loss2(domain_decoder_output, domain_label) #线性分类器
+        # discrimination = loss2(domain_decoder_output.squeeze(1), domain_label) #卷积分类器
+        # estimate E_{eps in N(0, 1)} [log q(y | z)]
+        cross_entropy_loss_montecarlo = torch.mean(cross_entropy_loss, dim=-1)
+        minusI_ZY_bound = torch.mean(cross_entropy_loss_montecarlo, dim=0)
+        return (torch.mean(minusI_ZY_bound) + lambda1 * torch.mean(I_ZX_bound)
+                + torch.sum(discrimination), torch.mean(I_ZX_bound), torch.mean(minusI_ZY_bound),
+                torch.sum(discrimination))#临时增加to_decoder
+
+    def batch_loss_multistep(self, num_samples, batch_x, batch_y, domain_label):
+        batch_size = batch_x.size()[0]
+        domain_label = domain_label.long()
+        prior_Z_distr = torch.zeros(batch_size, self.dimZ).cuda(), torch.ones(batch_size, self.dimZ).cuda()
+        encoder_Z_distr = self.encoder_result(batch_x)
+
+        I_ZX_bound = torch.mean(KL_between_normals(encoder_Z_distr, prior_Z_distr))
+        to_decoder = self.sample_encoder_Z(num_samples=self.num_samples, batch=batch_x)
+        decoder_logits = self.decoder_logits(to_decoder)  # 领域输出
+        # domain_decoder_output = self.domain_decoder(torch.cat((to_decoder,domain_label.unsqueeze(1).expand(num_samples,-1,self.dimZ)),dim=0))
+        # domain_decoder_output = self.domain_decoder(torch.mean(to_decoder, dim=0))
+        # 对领域分类器使用梯度反转层
+        domain_output = ReverseGrad()(torch.mean(to_decoder, dim=0), 0.1)
+        domain_decoder_output = self.domain_decoder(domain_output)
+        # batch should go first
+        decoder_logits = decoder_logits.permute(1, 2, 0)
+        decoder_logits = decoder_logits.view(-1, num_samples)
+        loss = nn.MSELoss(reduction='none')
+        loss2 = nn.CrossEntropyLoss(reduction='none')
+        batch_y = batch_y.view(-1)
+        cross_entropy_loss = loss(decoder_logits, batch_y[:, None].expand(-1, num_samples))
+        discrimination = loss2(domain_decoder_output, domain_label)
+        # estimate E_{eps in N(0, 1)} [log q(y | z)]
+        cross_entropy_loss_montecarlo = torch.mean(cross_entropy_loss, dim=-1)
+        minusI_ZY_bound = torch.mean(cross_entropy_loss_montecarlo, dim=0)
+        return (torch.mean(minusI_ZY_bound) + 0.01 * torch.mean(I_ZX_bound)
+                + torch.sum(discrimination), torch.mean(I_ZX_bound), torch.mean(minusI_ZY_bound),
+                torch.sum(discrimination))
+
+    def batch_loss_one_domain(self, num_samples, batch_x, batch_y, domain_label):
+        batch_size = batch_x.size()[0]
+        prior_Z_distr = torch.zeros(batch_size, self.dimZ).cuda(), torch.ones(batch_size, self.dimZ).cuda()
+        encoder_Z_distr = self.encoder_result(batch_x)
+
+        I_ZX_bound = torch.mean(KL_between_normals(encoder_Z_distr, prior_Z_distr))
+        to_decoder = self.sample_encoder_Z(num_samples=self.num_samples, batch=batch_x)
+        decoder_logits = self.decoder_logits(to_decoder)  # 领域输出
+
+        # batch should go first
+        decoder_logits = decoder_logits.permute(1, 2, 0)
+        decoder_logits = decoder_logits.view(-1, num_samples)
+        loss = nn.MSELoss(reduction='none')
+        cross_entropy_loss = loss(decoder_logits, batch_y[:, None].expand(-1, num_samples))
+        # estimate E_{eps in N(0, 1)} [log q(y | z)]
+        cross_entropy_loss_montecarlo = torch.mean(cross_entropy_loss, dim=-1)
+        minusI_ZY_bound = torch.mean(cross_entropy_loss_montecarlo, dim=0)
+        return (torch.mean(minusI_ZY_bound) + 0.01 * torch.mean(I_ZX_bound)
+                , torch.mean(I_ZX_bound), torch.mean(minusI_ZY_bound),
+                torch.sum(I_ZX_bound))
